@@ -110,14 +110,14 @@ async function waitOk(cfg: ChainCfg, hash: `0x${string}`) {
   if (r.status !== "success") throw new Error(`Transaction reverted: ${hash}`);
 }
 
+const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+
+const readAllowance = (cfg: ChainCfg, token: Address, account: Address, spender: Address) =>
+  cfg.client.readContract({ address: token, abi: erc20Abi, functionName: "allowance", args: [account, spender] });
+
 async function ensureAllowance(ctx: Ctx, token: Address, spender: Address, amount: bigint, step: string) {
   const { cfg, wallet, account, onProgress } = ctx;
-  const current = await cfg.client.readContract({
-    address: token,
-    abi: erc20Abi,
-    functionName: "allowance",
-    args: [account, spender],
-  });
+  const current = await readAllowance(cfg, token, account, spender);
   if (current >= amount) return onProgress(step, "skipped");
   onProgress(step, "active");
   const hash = await wallet.writeContract({
@@ -130,14 +130,43 @@ async function ensureAllowance(ctx: Ctx, token: Address, spender: Address, amoun
   });
   onProgress(step, "active", hash);
   await waitOk(cfg, hash);
+
+  // Public RPCs are load-balanced; the node we read from next may lag a block or two behind
+  // the one that confirmed the approval. Wait until the new allowance is actually visible.
+  let seen = 0n;
+  for (let i = 0; i < 15; i++) {
+    seen = await readAllowance(cfg, token, account, spender);
+    if (seen >= amount) break;
+    await sleep(2000);
+  }
+  if (seen < amount) {
+    throw new Error(
+      `Approval confirmed but allowance is ${seen} (< ${amount} needed). ` +
+        "If your wallet let you edit the spending cap, approve at least the swap amount and try again.",
+    );
+  }
   onProgress(step, "done", hash);
 }
+
+const isAllowanceError = (e: unknown) =>
+  /allowance|STF|TRANSFER_FROM_FAILED|insufficient/i.test(String((e as { message?: string })?.message ?? e));
 
 /** Simulate, send, wait. Simulation surfaces revert reasons before the wallet prompt. */
 async function send(ctx: Ctx, step: string, call: Parameters<ChainCfg["client"]["simulateContract"]>[0]) {
   const { cfg, wallet, account, onProgress } = ctx;
   onProgress(step, "active");
-  const { request } = await cfg.client.simulateContract({ ...call, account } as typeof call);
+  // Retry simulation briefly if a lagging RPC node hasn't seen a just-confirmed approval/transfer.
+  let sim: Awaited<ReturnType<ChainCfg["client"]["simulateContract"]>> | undefined;
+  for (let i = 0; ; i++) {
+    try {
+      sim = await cfg.client.simulateContract({ ...call, account } as typeof call);
+      break;
+    } catch (e) {
+      if (i >= 4 || !isAllowanceError(e)) throw e;
+      await sleep(3000);
+    }
+  }
+  const { request } = sim;
   const hash = await wallet.writeContract({ ...request, chain: cfg.chain } as Parameters<WalletClient["writeContract"]>[0]);
   onProgress(step, "active", hash);
   await waitOk(cfg, hash);
