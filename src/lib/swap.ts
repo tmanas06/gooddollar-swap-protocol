@@ -1,4 +1,16 @@
-import { type Address, type WalletClient, encodeFunctionData } from "viem";
+import { type Address, type WalletClient, encodeFunctionData, formatUnits } from "viem";
+
+// Superfluid SuperToken (G$ on Celo/XDC) custom errors -> readable text.
+const SF_ERRORS: Record<string, string> = {
+  "0x2f4cb941": "G$ balance too low for this swap (SF_TOKEN_MOVE_INSUFFICIENT_BALANCE)",
+};
+
+export function readableError(e: unknown): string {
+  const err = e as { shortMessage?: string; message?: string };
+  const msg = err?.shortMessage ?? err?.message ?? String(e);
+  const sig = msg.match(/0x[0-9a-f]{8}\b/i)?.[0]?.toLowerCase();
+  return sig && SF_ERRORS[sig] ? SF_ERRORS[sig] : msg;
+}
 import {
   type ChainCfg,
   type ReserveV3Route,
@@ -75,11 +87,20 @@ export function minOut(cfg: ChainCfg, q: Quote, bps: number) {
 }
 
 export async function getBalances(cfg: ChainCfg, account: Address) {
-  const [gd, native] = await Promise.all([
+  const r = cfg.route;
+  const [gd, native, stable] = await Promise.all([
     cfg.client.readContract({ address: cfg.gd.address, abi: erc20Abi, functionName: "balanceOf", args: [account] }),
     cfg.client.getBalance({ address: account }),
+    r.kind === "reserve-v3"
+      ? cfg.client.readContract({ address: r.stable.address, abi: erc20Abi, functionName: "balanceOf", args: [account] })
+      : Promise.resolve(0n),
   ]);
-  return { gd, native };
+  return { gd, native, stable };
+}
+
+export async function quoteStable(cfg: ChainCfg, amount: bigint) {
+  if (cfg.route.kind !== "reserve-v3" || amount === 0n) return 0n;
+  return (await quoteStableToNative(cfg, cfg.route, amount)).out;
 }
 
 // ---------- execution ----------
@@ -192,7 +213,12 @@ async function swapReserveV3(ctx: Ctx, r: ReserveV3Route, gdIn: bigint, bps: num
   const stableIn = (await balanceOf(cfg, r.stable.address, account)) - before;
   if (stableIn <= 0n) throw new Error(`No ${r.stable.symbol} received from the reserve swap`);
 
-  // Leg 2: stable -> native via Uniswap v3 (re-quoted with the actual amount received)
+  return swapStableLeg(ctx, r, stableIn, bps);
+}
+
+/** Leg 2 on its own: stable -> native via Uniswap v3. Also used to finish a half-done swap. */
+async function swapStableLeg(ctx: Ctx, r: ReserveV3Route, stableIn: bigint, bps: number) {
+  const { cfg, account } = ctx;
   await ensureAllowance(ctx, r.stable.address, r.router, stableIn, "approveStable");
   const { fee, out } = await quoteStableToNative(cfg, r, stableIn);
   const min = applySlippage(out, bps);
@@ -237,6 +263,24 @@ async function swapV2(ctx: Ctx, r: V2Route, gdIn: bigint, bps: number) {
   return out;
 }
 
+export function stableStepsFor(cfg: ChainCfg): Step[] {
+  return stepsFor(cfg).filter((s) => s.id === "approveStable" || s.id === "swapStable");
+}
+
+/** Swap the wallet's stable (cUSD / USDC) balance to native — recovery for an interrupted swap. */
+export async function swapStableToNative(opts: {
+  cfg: ChainCfg;
+  wallet: WalletClient;
+  account: Address;
+  amount: bigint;
+  slippageBps: number;
+  onProgress: Progress;
+}): Promise<bigint> {
+  const { cfg, amount, slippageBps, ...rest } = opts;
+  if (cfg.route.kind !== "reserve-v3") throw new Error("No stable leg on this network");
+  return swapStableLeg({ cfg, ...rest }, cfg.route, amount, slippageBps);
+}
+
 export async function swapGdToNative(opts: {
   cfg: ChainCfg;
   wallet: WalletClient;
@@ -247,6 +291,15 @@ export async function swapGdToNative(opts: {
 }): Promise<bigint> {
   const { cfg, gdIn, slippageBps, ...rest } = opts;
   const ctx: Ctx = { cfg, ...rest };
+
+  // Fresh balance check right before swapping (never trust a possibly stale UI value).
+  const gdBal = await balanceOf(cfg, cfg.gd.address, ctx.account);
+  if (gdBal < gdIn) {
+    throw new Error(
+      `Not enough G$ on ${cfg.chain.name}: wallet ${ctx.account} has ${formatUnits(gdBal, cfg.gd.decimals)} G$, ` +
+        `swap needs ${formatUnits(gdIn, cfg.gd.decimals)} G$.`,
+    );
+  }
   const r = cfg.route;
   return r.kind === "v2" ? swapV2(ctx, r, gdIn, slippageBps) : swapReserveV3(ctx, r, gdIn, slippageBps);
 }

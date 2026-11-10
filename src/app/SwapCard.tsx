@@ -11,7 +11,19 @@ import {
   parseUnits,
 } from "viem";
 import { CHAINS, type ChainCfg, type ChainKey } from "@/lib/contracts";
-import { type Quote, type StepStatus, getBalances, minOut, quote, stepsFor, swapGdToNative } from "@/lib/swap";
+import {
+  type Quote,
+  type StepStatus,
+  getBalances,
+  minOut,
+  quote,
+  quoteStable,
+  readableError,
+  stableStepsFor,
+  stepsFor,
+  swapGdToNative,
+  swapStableToNative,
+} from "@/lib/swap";
 
 declare global {
   interface Window {
@@ -24,10 +36,7 @@ const fmt = (v: bigint, d: number, max = 6) =>
 
 const short = (a: string) => `${a.slice(0, 6)}…${a.slice(-4)}`;
 
-function errMsg(e: unknown) {
-  const err = e as { shortMessage?: string; message?: string };
-  return err?.shortMessage ?? err?.message ?? String(e);
-}
+const errMsg = readableError;
 
 async function ensureChain(provider: EIP1193Provider, cfg: ChainCfg) {
   const { chain } = cfg;
@@ -59,7 +68,14 @@ export default function SwapCard() {
   const [chainKey, setChainKey] = useState<ChainKey>("xdc");
   const cfg = CHAINS[chainKey];
   const [account, setAccount] = useState<Address>();
-  const [balances, setBalances] = useState<{ key: ChainKey; gd: bigint; native: bigint }>();
+  const [balances, setBalances] = useState<{
+    key: ChainKey;
+    gd: bigint;
+    native: bigint;
+    stable: bigint;
+    stableOut: bigint; // quoted native for the leftover stable balance
+  }>();
+  const [activeSteps, setActiveSteps] = useState<"full" | "stable">("full");
   const [amount, setAmount] = useState("");
   const [lastQuote, setLastQuote] = useState<Quote & { key: ChainKey }>();
   const [slippageBps, setSlippageBps] = useState(100);
@@ -79,7 +95,8 @@ export default function SwapCard() {
   const refreshBalances = useCallback(async (key: ChainKey, acc: Address) => {
     try {
       const b = await getBalances(CHAINS[key], acc);
-      setBalances({ key, ...b });
+      const stableOut = await quoteStable(CHAINS[key], b.stable).catch(() => 0n);
+      setBalances({ key, ...b, stableOut });
     } catch (e) {
       setError(errMsg(e));
     }
@@ -167,32 +184,39 @@ export default function SwapCard() {
   const bal = balances?.key === chainKey ? balances : undefined;
   const insufficient = bal !== undefined && gdIn > bal.gd;
   const noGas = bal !== undefined && bal.native === 0n;
-  const stepList = stepsFor(cfg);
+  const stepList = activeSteps === "stable" ? stableStepsFor(cfg) : stepsFor(cfg);
+  const stableSym = cfg.route.kind === "reserve-v3" ? cfg.route.stable.symbol : "";
+  const stableDec = cfg.route.kind === "reserve-v3" ? cfg.route.stable.decimals : 18;
+  // Leftover stable from an interrupted G$ swap (ignore dust below 0.01).
+  const leftover = bal && bal.stable * 100n >= 10n ** BigInt(stableDec) ? bal.stable : 0n;
 
-  const doSwap = async () => {
-    if (!account || !q) return;
+  const run = async (mode: "full" | "stable") => {
+    if (!account) return;
+    if (mode === "full" && !q) return;
     setBusy(true);
     setError(undefined);
     setSuccess(undefined);
-    setSteps(Object.fromEntries(stepList.map((s) => [s.id, { status: "pending" as StepStatus }])));
+    setActiveSteps(mode);
+    const list = mode === "stable" ? stableStepsFor(cfg) : stepsFor(cfg);
+    setSteps(Object.fromEntries(list.map((s) => [s.id, { status: "pending" as StepStatus }])));
     let currentStep: string | undefined;
+    const onProgress = (id: string, status: StepStatus, hash?: `0x${string}`) => {
+      currentStep = id;
+      setSteps((s) => ({ ...s, [id]: { status, hash: hash ?? s[id]?.hash } }));
+    };
     try {
       await ensureChain(window.ethereum!, cfg);
-      const out = await swapGdToNative({
-        cfg,
-        wallet: walletFor(cfg),
-        account,
-        gdIn,
-        slippageBps,
-        onProgress: (id, status, hash) => {
-          currentStep = id;
-          setSteps((s) => ({ ...s, [id]: { status, hash: hash ?? s[id]?.hash } }));
-        },
-      });
-      setSuccess(
-        `Swapped ${fmt(gdIn, cfg.gd.decimals, 2)} G$ for ~${fmt(out, 18, 4)} ${cfg.nativeSymbol} on ${cfg.chain.name}`,
-      );
-      setAmount("");
+      const wallet = walletFor(cfg);
+      if (mode === "stable") {
+        const out = await swapStableToNative({ cfg, wallet, account, amount: leftover, slippageBps, onProgress });
+        setSuccess(`Swapped ${fmt(leftover, stableDec, 4)} ${stableSym} for ~${fmt(out, 18, 4)} ${cfg.nativeSymbol}`);
+      } else {
+        const out = await swapGdToNative({ cfg, wallet, account, gdIn, slippageBps, onProgress });
+        setSuccess(
+          `Swapped ${fmt(gdIn, cfg.gd.decimals, 2)} G$ for ~${fmt(out, 18, 4)} ${cfg.nativeSymbol} on ${cfg.chain.name}`,
+        );
+        setAmount("");
+      }
     } catch (e) {
       if (currentStep) setSteps((s) => ({ ...s, [currentStep!]: { ...s[currentStep!], status: "error" } }));
       setError(errMsg(e));
@@ -206,13 +230,14 @@ export default function SwapCard() {
 
   let cta = "Swap";
   if (!account) cta = "Connect wallet";
+  else if (!bal) cta = "Loading balance…";
   else if (gdIn === 0n) cta = "Enter an amount";
   else if (insufficient) cta = "Insufficient G$ balance";
   else if (noGas) cta = `Need ${cfg.nativeSymbol} for gas`;
   else if (quoting || !q) cta = "Fetching quote…";
   else if (busy) cta = "Swapping…";
 
-  const disabled = account ? busy || quoting || !q || gdIn === 0n || insufficient || noGas : false;
+  const disabled = account ? busy || !bal || quoting || !q || gdIn === 0n || insufficient || noGas : false;
   const explorer = cfg.chain.blockExplorers!.default.url;
 
   return (
@@ -246,6 +271,28 @@ export default function SwapCard() {
           </button>
         ))}
       </div>
+
+      {leftover > 0n && (
+        <div className="mb-3 rounded-2xl border border-amber-500/40 bg-amber-500/10 p-4 text-sm">
+          <p>
+            You have <b>{fmt(leftover, stableDec, 4)} {stableSym}</b> on {cfg.chain.name}
+            {bal && bal.stableOut > 0n && (
+              <>
+                {" "}
+                (≈ {fmt(bal.stableOut, 18, 4)} {cfg.nativeSymbol})
+              </>
+            )}
+            , probably from an unfinished swap.
+          </p>
+          <button
+            onClick={() => run("stable")}
+            disabled={busy || noGas}
+            className="mt-3 w-full rounded-xl bg-[var(--accent)] py-2.5 font-medium text-white disabled:opacity-40"
+          >
+            {noGas ? `Need ${cfg.nativeSymbol} for gas` : `Finish swap: ${stableSym} → ${cfg.nativeSymbol}`}
+          </button>
+        </div>
+      )}
 
       <div className="rounded-3xl border border-[var(--line)] bg-[var(--card)] p-4 shadow-sm">
         <div className="rounded-2xl bg-[var(--field)] p-4">
@@ -336,7 +383,7 @@ export default function SwapCard() {
         </div>
 
         <button
-          onClick={account ? doSwap : connect}
+          onClick={account ? () => run("full") : connect}
           disabled={disabled}
           className="mt-4 w-full rounded-2xl bg-[var(--accent)] py-3.5 text-lg font-medium text-white transition disabled:cursor-not-allowed disabled:opacity-40"
         >
